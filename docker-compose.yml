@@ -1,0 +1,58 @@
+version: '3.8'
+
+services:
+  dim_etapa_drone:
+    build: .
+    command: python drones/dim_etapa_drone.py
+    volumes:
+      - .:/app
+    environment:
+      - DB_HOST=${DB_HOST?Database host not set}
+      - DB_PORT=${DB_PORT?Database port not set}
+      - DB_NAME=${DB_NAME?Database name not set}
+      - DB_USER=${DB_USER?Database user not set}
+      - DB_PASSWORD=${DB_PASSWORD?Database password not set}
+    healthcheck:
+      test: ["CMD-SHELL", "psql postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME} -c 'SELECT 1 FROM trusted.dim_id_etapa_hubspot LIMIT 1' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  dim_owners_drone:
+    build: .
+    command: python drones/dim_owners_drone.py
+    volumes:
+      - .:/app
+    environment:
+      - DB_HOST=${DB_HOST?Database host not set}
+      - DB_PORT=${DB_PORT?Database port not set}
+      - DB_NAME=${DB_NAME?Database name not set}
+      - DB_USER=${DB_USER?Database user not set}
+      - DB_PASSWORD=${DB_PASSWORD?Database password not set}
+    healthcheck:
+      test: ["CMD-SHELL", "psql postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME} -c 'SELECT 1 FROM trusted.dim_id_owners_hubspot LIMIT 1' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  fato_deal_drone:
+    build: .
+    command: python drones/fato_deal_drone.py
+    volumes:
+      - .:/app
+    environment:
+      - DB_HOST=${DB_HOST?Database host not set}
+      - DB_PORT=${DB_PORT?Database port not set}
+      - DB_NAME=${DB_NAME?Database name not set}
+      - DB_USER=${DB_USER?Database user not set}
+      - DB_PASSWORD=${DB_PASSWORD?Database password not set}
+    depends_on:
+      dim_etapa_drone:
+        condition: service_healthy
+      dim_owners_drone:
+        condition: service_healthy
+    restart: unless-stopped
