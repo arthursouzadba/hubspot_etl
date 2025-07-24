@@ -62,6 +62,27 @@ class Database:
             logger.error(f"Error checking table existence: {e}")
             return False
 
+    def validate_dimension_data(db, conn):
+        """Validate dimension data before processing fact"""
+        with conn.cursor() as cursor:
+            # Check for NULL or empty keys in dimensions
+            cursor.execute(f"""
+            SELECT COUNT(*) FROM {db.config.dim_etapa_target} 
+            WHERE etapa_id IS NULL OR etapa_id = ''
+            """)
+            null_etapas = cursor.fetchone()[0]
+            
+            cursor.execute(f"""
+            SELECT COUNT(*) FROM {db.config.dim_owners_target} 
+            WHERE owner_id IS NULL OR owner_id = ''
+            """)
+            null_owners = cursor.fetchone()[0]
+            
+            if null_etapas > 0 or null_owners > 0:
+                raise Exception(
+                    f"Invalid dimension data: {null_etapas} null etapas, {null_owners} null owners"
+                )
+
     def create_schema(self, conn, schema_name):
         """Create target schema if not exists"""
         try:
@@ -74,21 +95,21 @@ class Database:
             raise
 
     def create_dim_etapa_table(self, conn):
-        """Create dim_etapa table if not exists"""
+        """Cria a tabela dim_etapa de forma idempotente"""
         try:
             create_table_query = f"""
             CREATE TABLE IF NOT EXISTS {self.config.dim_etapa_target} (
                 etapa_id TEXT PRIMARY KEY,
                 pipeline TEXT,
                 etapa TEXT
-            );"""
-            
+            );
+            """
             with conn.cursor() as cursor:
                 cursor.execute(create_table_query)
                 conn.commit()
-            logger.info(f"Table {self.config.dim_etapa_target} created/verified")
+            logger.info(f"Tabela {self.config.dim_etapa_target} verificada/criada")
         except Exception as e:
-            logger.error(f"Error creating table: {e}")
+            logger.error(f"Erro ao criar tabela de etapa: {e}")
             raise
 
     def create_dim_owners_table(self, conn):
@@ -240,32 +261,23 @@ class Database:
             return False
 
     def add_foreign_keys(self, conn):
-        """Add foreign keys safely"""
+        """Adiciona FKs com verificação adicional"""
         try:
             with conn.cursor() as cursor:
-                # Check for invalid references
+                # Verifica se ainda existem referências inválidas
                 cursor.execute(f"""
                 SELECT COUNT(*) FROM {self.config.fato_deal_target}
-                WHERE owner_id IS NOT NULL AND owner_id NOT IN (
-                    SELECT owner_id FROM {self.config.dim_owners_target}
-                )""")
-                invalid_owners = cursor.fetchone()[0]
-                
-                cursor.execute(f"""
-                SELECT COUNT(*) FROM {self.config.fato_deal_target}
-                WHERE etapa_id IS NOT NULL AND etapa_id NOT IN (
+                WHERE etapa_id IS NOT NULL 
+                AND etapa_id NOT IN (
                     SELECT etapa_id FROM {self.config.dim_etapa_target}
-                )""")
+                )
+                """)
                 invalid_etapas = cursor.fetchone()[0]
                 
-                if invalid_owners > 0 or invalid_etapas > 0:
-                    raise Exception(
-                        f"Invalid references found: "
-                        f"{invalid_owners} invalid owner_ids, "
-                        f"{invalid_etapas} invalid etapa_ids"
-                    )
+                if invalid_etapas > 0:
+                    raise Exception(f"Still found {invalid_etapas} invalid etapa references after cleanup")
                 
-                # Add FKs if no invalid references
+                # Adiciona as FKs
                 cursor.execute(f"""
                 ALTER TABLE {self.config.fato_deal_target}
                 ADD CONSTRAINT fk_owner FOREIGN KEY (owner_id) 
@@ -275,12 +287,16 @@ class Database:
                 ALTER TABLE {self.config.fato_deal_target}
                 ADD CONSTRAINT fk_etapa FOREIGN KEY (etapa_id) 
                 REFERENCES {self.config.dim_etapa_target}(etapa_id)
-                ON DELETE SET NULL;""")
+                ON DELETE SET NULL;
+                """)
+                
                 conn.commit()
-            logger.info("Foreign keys added successfully")
+                logger.info("Foreign keys added successfully")
+                
         except Exception as e:
             conn.rollback()
-            raise Exception(f"Failed to add FKs: {str(e)}")
+            logger.error(f"Failed to add FKs: {e}")
+            raise
 
     def fix_invalid_owners(self, conn):
         """Fix invalid owners by setting to NULL"""
@@ -333,4 +349,252 @@ class Database:
             logger.info("Temporary table cleaned up")
         except Exception as e:
             logger.error(f"Error cleaning up temp table: {e}")
+            raise
+
+    def check_table_has_data(self, conn, table_name):
+        """Verifica se a tabela contém dados"""
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(f"SELECT EXISTS (SELECT 1 FROM {table_name} LIMIT 1)")
+                return cursor.fetchone()[0]
+        except Exception as e:
+            logger.error(f"Erro ao verificar dados em {table_name}: {e}")
+            return False
+
+    def insert_update_data(self, conn, target_table, source_query):
+        """Atualiza dados existentes em vez de truncar"""
+        try:
+            table_name = target_table.split('.')[-1]  # Remove o schema do nome
+            temp_table = f"temp_{table_name}"
+            
+            with conn.cursor() as cursor:
+                # Cria tabela temporária
+                cursor.execute(f"CREATE TEMP TABLE {temp_table} AS {source_query}")
+                
+                # Determina a estratégia de update baseada no nome da tabela
+                if "dim_etapa" in target_table:
+                    # Atualização para dim_etapa
+                    cursor.execute(f"""
+                    UPDATE {target_table} t
+                    SET 
+                        pipeline = s.pipeline,
+                        etapa = s.etapa
+                    FROM {temp_table} s
+                    WHERE t.etapa_id = s.etapa_id
+                    """)
+                    
+                    # Insere novos registros para dim_etapa
+                    cursor.execute(f"""
+                    INSERT INTO {target_table} (etapa_id, pipeline, etapa)
+                    SELECT s.etapa_id, s.pipeline, s.etapa
+                    FROM {temp_table} s
+                    LEFT JOIN {target_table} t ON s.etapa_id = t.etapa_id
+                    WHERE t.etapa_id IS NULL
+                    """)
+                    
+                elif "dim_owners" in target_table:
+                    # Atualização para dim_owners
+                    cursor.execute(f"""
+                    UPDATE {target_table} t
+                    SET 
+                        owner_name = s.owner_name
+                    FROM {temp_table} s
+                    WHERE t.owner_id = s.owner_id
+                    """)
+                    
+                    # Insere novos registros para dim_owners
+                    cursor.execute(f"""
+                    INSERT INTO {target_table} (owner_id, owner_name)
+                    SELECT s.owner_id, s.owner_name
+                    FROM {temp_table} s
+                    LEFT JOIN {target_table} t ON s.owner_id = t.owner_id
+                    WHERE t.owner_id IS NULL
+                    """)
+                
+                # Limpa a tabela temporária
+                cursor.execute(f"DROP TABLE IF EXISTS {temp_table}")
+                
+                conn.commit()
+            logger.info(f"Dados atualizados em {target_table}")
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Falha na atualização: {e}")
+            raise
+
+    def process_fact(self, conn):
+        """Process fact table with dependencies"""
+        logger.info("Processing fact table")
+        
+        # Verify dimensions exist first
+        if not self.check_table_exists(conn, self.config.dim_etapa_target) or \
+        not self.check_table_exists(conn, self.config.dim_owners_target):
+            raise Exception("Dimension tables not found. Load them first.")
+        
+        # Create initial table
+        self.create_fato_deal_table(conn)
+        self.truncate_and_insert(conn, self.config.fato_deal_target, build_fato_deal_query(self.config))
+        
+        # Convert data types
+        try:
+            self.safe_convert_data_types(conn)
+            try:
+                self.add_foreign_keys(conn)
+            except Exception as fk_error:
+                logger.warning(f"FK constraints not added: {fk_error}")
+        except Exception as conv_error:
+            logger.error(f"Type conversion failed: {conv_error}")
+
+    def process_fact_with_fallback(self):
+        """Processa a tabela fato com fallback caso as FKs falhem"""
+        try:
+            with self.get_connection() as conn:
+                # Verifica se as dimensões existem
+                if not self.check_table_exists(conn, self.config.dim_etapa_target) or \
+                not self.check_table_exists(conn, self.config.dim_owners_target):
+                    raise Exception("Dimension tables not found. Load them first.")
+                
+                # Cria tabela inicial
+                self.create_fato_deal_table(conn)
+                
+                # Importa a função aqui para evitar circular imports
+                from src.etl import build_fato_deal_query
+                self.truncate_and_insert(conn, self.config.fato_deal_target, build_fato_deal_query(self.config))
+                
+                # Conversão de tipos
+                self.safe_convert_data_types(conn)
+                self.fix_invalid_references(conn)
+                self.add_foreign_keys(conn)
+
+                # Tenta adicionar FKs
+                try:
+                    self.add_foreign_keys(conn)
+                except Exception as fk_error:
+                    logger.warning(f"FK constraints not added: {fk_error}")
+                    
+        except Exception as e:
+            logger.error(f"Fact processing failed: {e}")
+            logger.info("Attempting fallback processing without FKs...")
+            with self.get_connection() as conn:
+                self.create_fato_deal_table(conn)
+                from src.etl import build_fato_deal_query
+                self.truncate_and_insert(conn, self.config.fato_deal_target, build_fato_deal_query(self.config))
+                self.safe_convert_data_types(conn)
+
+    def log_invalid_references(self, conn):
+        """Log details about invalid references between fact and dimensions"""
+        with conn.cursor() as cursor:
+            # Check invalid etapa references
+            cursor.execute(f"""
+            SELECT f.etapa_id, COUNT(*) as invalid_count
+            FROM {self.config.fato_deal_target} f
+            WHERE f.etapa_id IS NOT NULL 
+            AND f.etapa_id NOT IN (
+                SELECT etapa_id FROM {self.config.dim_etapa_target}
+            )
+            GROUP BY f.etapa_id
+            ORDER BY invalid_count DESC
+            LIMIT 10;
+            """)
+            invalid_etapas = cursor.fetchall()
+            
+            if invalid_etapas:
+                logger.warning("Top invalid etapa references:")
+                for etapa_id, count in invalid_etapas:
+                    logger.warning(f"etapa_id: {etapa_id} - {count} records")
+
+            # Check invalid owner references
+            cursor.execute(f"""
+            SELECT f.owner_id, COUNT(*) as invalid_count
+            FROM {self.config.fato_deal_target} f
+            WHERE f.owner_id IS NOT NULL 
+            AND f.owner_id NOT IN (
+                SELECT owner_id FROM {self.config.dim_owners_target}
+            )
+            GROUP BY f.owner_id
+            ORDER BY invalid_count DESC
+            LIMIT 10;
+            """)
+            invalid_owners = cursor.fetchall()
+            
+            if invalid_owners:
+                logger.warning("Top invalid owner references:")
+                for owner_id, count in invalid_owners:
+                    logger.warning(f"owner_id: {owner_id} - {count} records")
+
+    def validate_data_consistency(self, conn):
+        """Valida a consistência dos dados nas tabelas relacionadas"""
+        try:
+            with conn.cursor() as cursor:
+                # Verifica referências inválidas
+                cursor.execute(f"""
+                SELECT COUNT(*) FROM {self.config.fato_deal_target}
+                WHERE etapa_id IS NOT NULL 
+                AND etapa_id NOT IN (
+                    SELECT etapa_id FROM {self.config.dim_etapa_target}
+                )
+                """)
+                invalid_etapas = cursor.fetchone()[0]
+                
+                cursor.execute(f"""
+                SELECT COUNT(*) FROM {self.config.fato_deal_target}
+                WHERE owner_id IS NOT NULL 
+                AND owner_id NOT IN (
+                    SELECT owner_id FROM {self.config.dim_owners_target}
+                )
+                """)
+                invalid_owners = cursor.fetchone()[0]
+                
+                if invalid_etapas > 0 or invalid_owners > 0:
+                    logger.warning(f"Data consistency issues: {invalid_etapas} invalid etapa references, {invalid_owners} invalid owner references")
+                else:
+                    logger.info("Data consistency validated - no invalid references found")
+                    
+        except Exception as e:
+            logger.error(f"Error validating data consistency: {e}")
+            raise
+
+    def fix_invalid_references(self, conn):
+        """Corrige referências inválidas antes de aplicar FKs"""
+        try:
+            with conn.cursor() as cursor:
+                # 1. Adiciona etapas faltantes à dimensão
+                cursor.execute(f"""
+                INSERT INTO {self.config.dim_etapa_target} (etapa_id, pipeline, etapa)
+                SELECT DISTINCT f.etapa_id, 'DESCONHECIDO', 'DESCONHECIDO'
+                FROM {self.config.fato_deal_target} f
+                WHERE f.etapa_id IS NOT NULL
+                AND f.etapa_id NOT IN (
+                    SELECT etapa_id FROM {self.config.dim_etapa_target}
+                )
+                ON CONFLICT (etapa_id) DO NOTHING;
+                """)
+                
+                # 2. Adiciona owners faltantes à dimensão
+                cursor.execute(f"""
+                INSERT INTO {self.config.dim_owners_target} (owner_id, owner_name)
+                SELECT DISTINCT f.owner_id, 'DESCONHECIDO'
+                FROM {self.config.fato_deal_target} f
+                WHERE f.owner_id IS NOT NULL
+                AND f.owner_id NOT IN (
+                    SELECT owner_id FROM {self.config.dim_owners_target}
+                )
+                ON CONFLICT (owner_id) DO NOTHING;
+                """)
+                
+                # 3. Remove referências completamente inválidas (se necessário)
+                cursor.execute(f"""
+                UPDATE {self.config.fato_deal_target}
+                SET etapa_id = NULL
+                WHERE etapa_id IS NOT NULL
+                AND etapa_id NOT IN (
+                    SELECT etapa_id FROM {self.config.dim_etapa_target}
+                );
+                """)
+                
+                conn.commit()
+                logger.info("Invalid references fixed successfully")
+                
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Error fixing references: {e}")
             raise

@@ -1,19 +1,38 @@
 version: '3.8'
 
 services:
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+    ports:
+      - "${DB_PORT}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   dim_etapa_drone:
     build: .
     command: python drones/dim_etapa_drone.py
     volumes:
       - .:/app
     environment:
-      - DB_HOST=${DB_HOST?Database host not set}
-      - DB_PORT=${DB_PORT?Database port not set}
-      - DB_NAME=${DB_NAME?Database name not set}
-      - DB_USER=${DB_USER?Database user not set}
-      - DB_PASSWORD=${DB_PASSWORD?Database password not set}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "psql postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME} -c 'SELECT 1 FROM trusted.dim_id_etapa_hubspot LIMIT 1' || exit 1"]
+      test: ["CMD-SHELL", "psql postgresql://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME} -c 'SELECT 1 FROM trusted.dim_id_etapa_hubspot LIMIT 1' || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -26,13 +45,16 @@ services:
     volumes:
       - .:/app
     environment:
-      - DB_HOST=${DB_HOST?Database host not set}
-      - DB_PORT=${DB_PORT?Database port not set}
-      - DB_NAME=${DB_NAME?Database name not set}
-      - DB_USER=${DB_USER?Database user not set}
-      - DB_PASSWORD=${DB_PASSWORD?Database password not set}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "psql postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME} -c 'SELECT 1 FROM trusted.dim_id_owners_hubspot LIMIT 1' || exit 1"]
+      test: ["CMD-SHELL", "psql postgresql://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME} -c 'SELECT 1 FROM trusted.dim_id_owners_hubspot LIMIT 1' || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -45,14 +67,25 @@ services:
     volumes:
       - .:/app
     environment:
-      - DB_HOST=${DB_HOST?Database host not set}
-      - DB_PORT=${DB_PORT?Database port not set}
-      - DB_NAME=${DB_NAME?Database name not set}
-      - DB_USER=${DB_USER?Database user not set}
-      - DB_PASSWORD=${DB_PASSWORD?Database password not set}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
     depends_on:
+      postgres:
+        condition: service_healthy
       dim_etapa_drone:
         condition: service_healthy
       dim_owners_drone:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "psql postgresql://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME} -c 'SELECT 1 FROM trusted.fato_id_deal_hubspot WHERE etapa_id IS NOT NULL LIMIT 1' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     restart: unless-stopped
+
+volumes:
+  postgres_data:
